@@ -1,28 +1,13 @@
 #!/usr/bin/env python3
 """
 Telegram bot for looking up multi-subject scores by Iranian national code.
-Features added:
-- Multiple subject scores per person (subject normalized)
+
+Features:
+- Multiple subject scores per person
 - Admins can add/edit/remove scores via bot commands
-- Lookups by national code (returns all subjects) or by "code subject" (returns single subject)
-- HMAC-SHA256 hashing of national codes before storing in DB
-- Simple admin authorization using TELEGRAM admin IDs
-
-Usage:
-- Set environment variables TELEGRAM_TOKEN and HMAC_SECRET
-- Optionally set ADMINS as comma-separated Telegram user IDs (numbers)
-- Run: python amir.py
-
-Commands (admin only):
-- /add <national_code> <subject> <score>   -> add or set score for subject
-- /edit <national_code> <subject> <score>  -> alias for /add (upsert)
-- /remove <national_code> <subject>        -> remove specific subject score
-- /remove_all <national_code>              -> remove all scores for a code
-- /list_codes                               -> list hashed entries (admin)
-
-For users:
-- Send just the 10-digit national code to get all subjects and scores
-- Send "<code> <subject>" (or use | or :) to get a single subject score
+- Bulk add via text or Excel/CSV files
+- Lookups by national code (all subjects) or by "code subject" (single subject)
+- HMAC-SHA256 hashing of national codes
 """
 
 import logging
@@ -34,14 +19,14 @@ import hashlib
 from datetime import datetime
 from typing import Optional
 
-from telegram import Update
+import pandas as pd
+from telegram import Update, Document
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # ---------- CONFIG ----------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 HMAC_SECRET = os.environ.get("HMAC_SECRET", "replace-with-a-long-random-secret")
 DB_PATH = os.environ.get("DB_PATH", "scores.db")
-# ADMINS: comma separated Telegram user ids (integers)
 ADMINS = set(int(x) for x in os.environ.get("ADMINS", "").split(',') if x.strip().isdigit())
 # ----------------------------
 
@@ -59,12 +44,10 @@ def persian_to_english_number(text: str) -> str:
     return text.translate(translation_table)
 
 # ---------------- DB ----------------
-
 def get_conn():
     conn = sqlite3.connect(DB_PATH, isolation_level=None)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
-
 
 def init_db():
     conn = get_conn()
@@ -83,11 +66,8 @@ def init_db():
     conn.close()
 
 # ---------------- security helpers ----------------
-
 def hmac_code(code: str) -> str:
-    """Return HMAC-SHA256 hex of the national code using HMAC_SECRET."""
     return hmac.new(HMAC_SECRET.encode('utf-8'), code.encode('utf-8'), hashlib.sha256).hexdigest()
-
 
 def valid_iranian_national_code(code: str) -> bool:
     if not NATIONAL_CODE_RE.match(code):
@@ -98,13 +78,9 @@ def valid_iranian_national_code(code: str) -> bool:
     s = sum(digits[i] * (10 - i) for i in range(9))
     r = s % 11
     check = digits[9]
-    if r < 2:
-        return check == r
-    else:
-        return check == 11 - r
+    return check == r if r < 2 else check == 11 - r
 
 # ---------------- data ops ----------------
-
 def add_or_update_score(national_code: str, subject: str, score: float):
     code_h = hmac_code(national_code)
     subj = subject.strip().lower()
@@ -112,13 +88,12 @@ def add_or_update_score(national_code: str, subject: str, score: float):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO scores (code_hmac, subject, score, updated_at) VALUES (?, ?, ?, ?)"
-        " ON CONFLICT(code_hmac, subject) DO UPDATE SET score=excluded.score, updated_at=excluded.updated_at",
+        "INSERT INTO scores (code_hmac, subject, score, updated_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(code_hmac, subject) DO UPDATE SET score=excluded.score, updated_at=excluded.updated_at",
         (code_h, subj, score, now)
     )
     conn.commit()
     conn.close()
-
 
 def remove_score(national_code: str, subject: str) -> bool:
     code_h = hmac_code(national_code)
@@ -131,7 +106,6 @@ def remove_score(national_code: str, subject: str) -> bool:
     conn.close()
     return changed > 0
 
-
 def remove_all_scores(national_code: str) -> int:
     code_h = hmac_code(national_code)
     conn = get_conn()
@@ -142,7 +116,6 @@ def remove_all_scores(national_code: str) -> int:
     conn.close()
     return removed
 
-
 def lookup_scores(national_code: str):
     code_h = hmac_code(national_code)
     conn = get_conn()
@@ -151,7 +124,6 @@ def lookup_scores(national_code: str):
     rows = cur.fetchall()
     conn.close()
     return rows
-
 
 def lookup_subject(national_code: str, subject: str) -> Optional[tuple]:
     code_h = hmac_code(national_code)
@@ -163,25 +135,23 @@ def lookup_subject(national_code: str, subject: str) -> Optional[tuple]:
     conn.close()
     return row
 
-# ---------------- telegram handlers ----------------
+# ---------------- telegram helpers ----------------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
 
+# ---------------- telegram handlers ----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "سلام! کافیه کد ملی ۱۰ رقمی خودت رو ارسال کنی تا نمراتت رو ببینی.\n"
         "اگر می‌خوای نمرهٔ یک درس خاص رو ببینی، فرمت زیر رو بفرست:\n"
         "<کدملی>|<نام درس>  یا  <کدملی> <نام درس>\n\n"
-        "ادمین‌ها: /add, /edit, /remove, /remove_all, /list_codes"
+        "ادمین‌ها: /add, /edit, /remove, /remove_all, /list_codes, /add_bulk, /add_file"
     )
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS
-
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_cmd(update, context)
 
-
+# --------------- single add/edit ---------------
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
@@ -192,7 +162,6 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not payload:
         await update.message.reply_text("فرمت: /add <کدملی> <نام درس> <نمره>")
         return
-    # split and remove empty parts
     parts = [p.strip() for p in SPLIT_RE.split(payload) if p.strip()]
     if len(parts) < 3:
         await update.message.reply_text("فرمت درست نیست. مثال: /add 0012345674 ریاضی 18")
@@ -212,12 +181,10 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_or_update_score(code, subject, score)
     await update.message.reply_text(f"نمرهٔ {subject} برای کد {code} ثبت/بروزرسانی شد.")
 
-
-# edit is alias of add
 async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await add_cmd(update, context)
 
-
+# --------------- remove ---------------
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
@@ -240,20 +207,17 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("چنین نمره‌ای پیدا نشد.")
 
-
 async def remove_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_admin(user.id):
         await update.message.reply_text("فقط ادمین‌ها مجاز به استفاده از این دستور هستند.")
         return
-    payload = update.message.text.partition(' ')[2].strip()
-    code = persian_to_english_number(payload)
+    code = persian_to_english_number(update.message.text.partition(' ')[2].strip())
     if not valid_iranian_national_code(code):
         await update.message.reply_text("فرمت: /remove_all <کدملی>")
         return
     removed = remove_all_scores(code)
     await update.message.reply_text(f"{removed} ردیف برای این کد حذف شد.")
-
 
 async def list_codes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -271,7 +235,76 @@ async def list_codes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "کدهای هش‌شده (تا 200):\n" + '\n'.join(r[0] for r in rows)
     await update.message.reply_text(text)
 
+# ---------------- bulk add text ----------------
+async def add_bulk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("فقط ادمین‌ها مجاز به استفاده از این دستور هستند.")
+        return
+    payload = update.message.text.partition(' ')[2].strip()
+    if not payload:
+        await update.message.reply_text("فرمت: /add_bulk\nکدملی نام_درس نمره")
+        return
+    lines = payload.splitlines()
+    results = []
+    for line in lines:
+        parts = [p.strip() for p in SPLIT_RE.split(line) if p.strip()]
+        if len(parts) < 3:
+            results.append(f"خط '{line}': فرمت اشتباه")
+            continue
+        code, *subject_parts, score_s = parts
+        subject = ' '.join(subject_parts)
+        code = persian_to_english_number(code)
+        score_s = persian_to_english_number(score_s)
+        if not valid_iranian_national_code(code):
+            results.append(f"{code}: کد ملی نامعتبر")
+            continue
+        try:
+            score = float(score_s)
+        except ValueError:
+            results.append(f"{code} {subject}: نمره باید عدد باشد")
+            continue
+        add_or_update_score(code, subject, score)
+        results.append(f"{code} {subject}: ثبت شد")
+    await update.message.reply_text("\n".join(results))
 
+# ---------------- bulk add file ----------------
+async def add_file_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("فقط ادمین‌ها مجاز به استفاده از این دستور هستند.")
+        return
+    if not update.message.document:
+        await update.message.reply_text("لطفاً فایل Excel یا CSV ارسال کنید.")
+        return
+    file: Document = update.message.document
+    file_path = f"/tmp/{file.file_name}"
+    await file.get_file().download_to_drive(file_path)
+    try:
+        if file.file_name.endswith(".csv"):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_excel(file_path)
+        results = []
+        for idx, row in df.iterrows():
+            code = persian_to_english_number(str(row[0]))
+            subject = str(row[1])
+            score_s = persian_to_english_number(str(row[2]))
+            if not valid_iranian_national_code(code):
+                results.append(f"{code}: کد ملی نامعتبر")
+                continue
+            try:
+                score = float(score_s)
+            except ValueError:
+                results.append(f"{code} {subject}: نمره باید عدد باشد")
+                continue
+            add_or_update_score(code, subject, score)
+            results.append(f"{code} {subject}: ثبت شد")
+        await update.message.reply_text("\n".join(results))
+    except Exception as e:
+        await update.message.reply_text(f"خطا در پردازش فایل: {e}")
+
+# ---------------- handle messages ----------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
@@ -302,9 +335,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"{row[0].capitalize()}: {row[1]} (بروزرسانی: {row[2]})")
 
-
 # ---------------- main ----------------
-
 def main():
     init_db()
     conn = get_conn()
@@ -313,10 +344,11 @@ def main():
     count = cur.fetchone()[0]
     conn.close()
     if count == 0:
+        # نمونه داده برای توسعه
         add_or_update_score("0012345674", "ریاضی", 18)
         add_or_update_score("0012345674", "فارسی", 17)
         add_or_update_score("0084571239", "زبان", 16)
-        logger.info("داده‌های نمونه اضافه شد (فقط محیط توسعه).")
+        logger.info("داده‌های نمونه اضافه شد (محیط توسعه).")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -328,13 +360,14 @@ def main():
     app.add_handler(CommandHandler('remove', remove_cmd))
     app.add_handler(CommandHandler('remove_all', remove_all_cmd))
     app.add_handler(CommandHandler('list_codes', list_codes_cmd))
+    app.add_handler(CommandHandler('add_bulk', add_bulk_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r'/add_file'), add_file_cmd))
 
     # messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("بات آماده است — polling اجرا می‌شود (برای توسعه).")
+    logger.info("بات آماده است — polling اجرا می‌شود.")
     app.run_polling()
-
 
 if __name__ == '__main__':
     main()
