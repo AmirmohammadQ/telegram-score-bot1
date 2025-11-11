@@ -371,3 +371,24 @@ def main():
 
 if __name__ == '__main__':
     main()
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Bot is running", 200
+
+if __name__ == '__main__':
+    import threading
+
+    # Start Telegram bot in a separate thread
+    import asyncio
+    from telegram_bot import main as telegram_main  # فرض کن بقیه کدها داخل telegram_bot.py هست
+
+    bot_thread = threading.Thread(target=telegram_main)
+    bot_thread.start()
+
+    # Start Flask server
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
