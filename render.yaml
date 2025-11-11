@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: telegram-score-bot
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: "python telegram_bot_scores.py"
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: HMAC_SECRET
+        sync: false
+      - key: ADMINS
+        sync: false
