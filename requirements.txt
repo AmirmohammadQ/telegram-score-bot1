@@ -1,4 +1,3 @@
 python-telegram-bot==20.5
 pandas
 openpyxl
-Flask==2.3.3
