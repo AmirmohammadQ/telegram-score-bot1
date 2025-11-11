@@ -11,21 +11,18 @@ Features added:
 Usage:
 - Set environment variables TELEGRAM_TOKEN and HMAC_SECRET
 - Optionally set ADMINS as comma-separated Telegram user IDs (numbers)
-- Run: python telegram_bot_scores.py
+- Run: python amir.py
 
 Commands (admin only):
-- /add <national_code>|<subject>|<score>   -> add or set score for subject
-- /edit <national_code>|<subject>|<score>  -> alias for /add (upsert)
-- /remove <national_code>|<subject>        -> remove specific subject score
+- /add <national_code> <subject> <score>   -> add or set score for subject
+- /edit <national_code> <subject> <score>  -> alias for /add (upsert)
+- /remove <national_code> <subject>        -> remove specific subject score
 - /remove_all <national_code>              -> remove all scores for a code
 - /list_codes                               -> list hashed entries (admin)
 
 For users:
 - Send just the 10-digit national code to get all subjects and scores
 - Send "<code> <subject>" (or use | or :) to get a single subject score
-
-Note: This is an example for development. For production use, deploy on a server
-and protect keys with a secret manager. Do not log raw national codes.
 """
 
 import logging
@@ -53,6 +50,13 @@ logger = logging.getLogger(__name__)
 
 NATIONAL_CODE_RE = re.compile(r"^\d{10}$")
 SPLIT_RE = re.compile(r"[|:\s]+")
+
+# ---------------- Persian number helper ----------------
+def persian_to_english_number(text: str) -> str:
+    persian_numbers = '۰۱۲۳۴۵۶۷۸۹'
+    english_numbers = '0123456789'
+    translation_table = str.maketrans(persian_numbers, english_numbers)
+    return text.translate(translation_table)
 
 # ---------------- DB ----------------
 
@@ -88,7 +92,6 @@ def hmac_code(code: str) -> str:
 def valid_iranian_national_code(code: str) -> bool:
     if not NATIONAL_CODE_RE.match(code):
         return False
-    # Reject same-digit codes like 0000000000
     if len(set(code)) == 1:
         return False
     digits = list(map(int, code))
@@ -187,13 +190,17 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     payload = text.partition(' ')[2].strip()
     if not payload:
-        await update.message.reply_text("فرمت: /add <کدملی>|<نام درس>|<نمره>")
+        await update.message.reply_text("فرمت: /add <کدملی> <نام درس> <نمره>")
         return
+    # split and remove empty parts
     parts = [p.strip() for p in SPLIT_RE.split(payload) if p.strip()]
     if len(parts) < 3:
-        await update.message.reply_text("فرمت درست نیست. مثال: /add 0012345674|ریاضی|18")
+        await update.message.reply_text("فرمت درست نیست. مثال: /add 0012345674 ریاضی 18")
         return
-    code, subject, score_s = parts[0], ' '.join(parts[1:-1]) if len(parts)>3 else parts[1], parts[-1]
+    code, *middle, score_s = parts
+    subject = ' '.join(middle)
+    code = persian_to_english_number(code)
+    score_s = persian_to_english_number(score_s)
     if not valid_iranian_national_code(code):
         await update.message.reply_text("کد ملی نامعتبر است.")
         return
@@ -219,9 +226,11 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = update.message.text.partition(' ')[2].strip()
     parts = [p.strip() for p in SPLIT_RE.split(payload) if p.strip()]
     if len(parts) < 2:
-        await update.message.reply_text("فرمت: /remove <کدملی>|<نام درس>")
+        await update.message.reply_text("فرمت: /remove <کدملی> <نام درس>")
         return
-    code, subject = parts[0], ' '.join(parts[1:])
+    code, *subject_parts = parts
+    subject = ' '.join(subject_parts)
+    code = persian_to_english_number(code)
     if not valid_iranian_national_code(code):
         await update.message.reply_text("کد ملی نامعتبر است.")
         return
@@ -238,7 +247,7 @@ async def remove_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("فقط ادمین‌ها مجاز به استفاده از این دستور هستند.")
         return
     payload = update.message.text.partition(' ')[2].strip()
-    code = payload.strip()
+    code = persian_to_english_number(payload)
     if not valid_iranian_national_code(code):
         await update.message.reply_text("فرمت: /remove_all <کدملی>")
         return
@@ -267,19 +276,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
-    # try forms: "0012345674"  or "0012345674 ریاضی"  or "0012345674|ریاضی" or "0012345674:ریاضی"
     parts = [p.strip() for p in SPLIT_RE.split(text) if p.strip()]
     if len(parts) == 0:
         await update.message.reply_text("لطفاً کد ملی ۱۰ رقمی یا کد ملی همراه نام درس را ارسال کنید.")
         return
-    code = parts[0]
+    code = persian_to_english_number(parts[0])
     if not NATIONAL_CODE_RE.match(code):
         await update.message.reply_text("لطفاً کد ملی ۱۰ رقمی خود را ارسال کنید.")
         return
     if not valid_iranian_national_code(code):
         await update.message.reply_text("کد ملی نامعتبر است. لطفاً دوباره بررسی کنید.")
         return
-    # if only code => list all
     if len(parts) == 1:
         rows = lookup_scores(code)
         if not rows:
@@ -288,7 +295,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"{r[0].capitalize()}: {r[1]} (بروزرسانی: {r[2]})" for r in rows]
         await update.message.reply_text("\n".join(lines))
         return
-    # else code + subject
     subject = ' '.join(parts[1:])
     row = lookup_subject(code, subject)
     if not row:
@@ -301,14 +307,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    # optional: add sample entries for testing (only when DB empty)
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM scores")
     count = cur.fetchone()[0]
     conn.close()
     if count == 0:
-        # only for development/testing
         add_or_update_score("0012345674", "ریاضی", 18)
         add_or_update_score("0012345674", "فارسی", 17)
         add_or_update_score("0084571239", "زبان", 16)
